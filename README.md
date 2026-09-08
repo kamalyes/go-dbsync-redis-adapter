@@ -74,40 +74,87 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// UserRow 同步行：实现 dbsync.KeysetRow（水位时间 + 同水位消歧 ID）
+type UserRow struct {
+	UserID    string
+	UpdatedAt time.Time
+}
+
+func (u *UserRow) WatermarkAt() time.Time { return u.UpdatedAt }
+func (u *UserRow) CursorID() string       { return u.UserID }
+
+// userSource 增量 + 全量分页拉取源（WithFullBootstrap 要求实现 FullSource）
+type userSource struct{}
+
+// FetchIncremental 按复合游标拉增量：
+// SELECT ... WHERE (updated_at, user_id) > (after, afterCursorID) ORDER BY updated_at, user_id LIMIT limit
+func (s *userSource) FetchIncremental(ctx context.Context, after time.Time, afterCursorID string, limit int) ([]*UserRow, error) {
+	return nil, nil // 拉尽返回空切片
+}
+
+// FetchFullPage 全量回补分页：SELECT ... WHERE user_id > afterCursorID ORDER BY user_id LIMIT limit
+func (s *userSource) FetchFullPage(ctx context.Context, afterCursorID string, limit int) ([]*UserRow, error) {
+	return nil, nil
+}
+
+// userSink 目标写入端（幂等写入，如 ClickHouse ReplacingMergeTree）
+type userSink struct{}
+
+func (s *userSink) WriteBatch(ctx context.Context, rows []*UserRow) error {
+	return nil
+}
+
+// targetTable 自愈判定：目标表是否为空
+type targetTable struct{}
+
+func (t *targetTable) IsEmpty(ctx context.Context) (bool, error) { return false, nil }
+
 func main() {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
 
 	// 一个 Store 实现三个接口：WatermarkStore / CursorStore / LockManager
-	store := redisadapter.NewStore(rdb, "myapp:user_sync")
-	store = store.WithLockTTL(90 * time.Second) // 可选：覆盖默认锁 TTL 65s（必须 > 单次同步超时）
+	store := redisadapter.NewStore(rdb, "myapp:user_sync").
+		WithLockTTL(90 * time.Second) // 可选：覆盖默认锁 TTL 65s（必须 > 单次同步超时）
 
-	syncer, err := dbsync.NewSyncer[UserRow](
+	syncer, err := dbsync.NewSyncer[*UserRow](
 		"user_sync",
-		&userSource{},
-		&userSink{},
-		dbsync.NewCompositeWatermarkStore(store, gormCheckpoint), // Redis 主读 + DB 兜底
-		store,                                                       // 选主锁
-		dbsync.WithFullBootstrap[UserRow](store, 5*time.Minute),    // bootstrap 游标也用 Redis
-		dbsync.WithSelfHeal[UserRow](targetTable),
+		&userSource{},                                           // 增量拉取源
+		&userSink{},                                             // 目标写入端
+		store,                                                   // 水位（WatermarkStore）
+		store,                                                   // 选主锁（LockManager）
+		dbsync.WithFullBootstrap[*UserRow](store, 5*time.Minute), // bootstrap 进度游标也走 Redis（CursorStore）
+		dbsync.WithSelfHeal[*UserRow](&targetTable{}),           // 水位在、目标表被清空 → 强制重新回补
+		dbsync.WithLogger[*UserRow](dbsync.NewDefaultLogger()),  // [DBSYNC] 前缀日志
 	)
 	if err != nil {
 		panic(err)
 	}
-	_ = syncer
-	_ = context.Background()
+
+	// 阻塞循环（ticker 增量 + 无水位时 bootstrap）；生产中传入可取消 ctx 控制退出
+	syncer.Start(context.Background())
 }
+```
+
+### 水位双存储：Redis 主读 + DB 持久兜底
+
+Redis 意外清空（如误 FLUSHDB）时水位可从持久层恢复，将 `Store` 与
+[go-dbsync-gorm-adapter](https://github.com/kamalyes/go-dbsync-gorm-adapter) 的 checkpoint 组合成复合水位：
+
+```go
+// 读序：Redis → miss 则查 DB 并回填；写序：DB 先落 → Redis 后落
+watermark := dbsync.NewCompositeWatermarkStore(store, gormCheckpoint)
 ```
 
 ## 📋 API 速览
 
 | 方法 | 说明 |
 | --- | --- |
-| `NewStore(rdb, prefix)` | 创建三合一 Store（锁 TTL 默认 65s） |
+| `NewStore(rdb, prefix)` | 创建三合一 Store（`rdb` 为 `redis.UniversalClient`，单机/集群客户端均可；锁 TTL 默认 65s） |
 | `(*Store).WithLockTTL(ttl)` | 链式覆盖锁 TTL（必须 > 单次同步超时） |
 | `ReadWatermark(ctx)` | 读水位（miss 返回 ok=false；损坏视为 miss 触发重拉） |
 | `WriteWatermark(ctx, at, cursorID)` | 水位 MSet 原子写 |
-| `ReadCursor / WriteCursor / DeleteCursor` | bootstrap 进度游标生命周期 |
-| `Acquire(ctx)` | 选主锁（返回 release + 是否成功） |
+| `ReadCursor / WriteCursor / DeleteCursor` | bootstrap 进度游标生命周期（24h TTL） |
+| `Acquire(ctx)` | 选主锁（返回 release + 是否成功；释放走 Lua compare-and-del） |
 
 ## 🧪 测试
 
