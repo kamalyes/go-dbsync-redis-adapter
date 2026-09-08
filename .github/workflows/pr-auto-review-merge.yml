@@ -145,7 +145,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: ⏱️ Wait for lint check
-        uses: lewagon/wait-on-check-action@v1.3.4
+        uses: lewagon/wait-on-check-action@v1.9.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           running-workflow-name: Wait for Checks
@@ -154,7 +154,7 @@ jobs:
           wait-interval: 30
 
       - name: ⏱️ Wait for test check
-        uses: lewagon/wait-on-check-action@v1.3.4
+        uses: lewagon/wait-on-check-action@v1.9.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           running-workflow-name: Wait for Checks
