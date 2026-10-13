@@ -3,7 +3,7 @@ module github.com/kamalyes/go-dbsync-redis-adapter
 go 1.25.0
 
 require (
-	github.com/alicebob/miniredis/v2 v2.39.0
+	github.com/alicebob/miniredis/v2 v2.40.0
 	github.com/kamalyes/go-dbsync v0.0.0-20260831152759-45947fc4732c
 	github.com/redis/go-redis/v9 v9.22.0
 )
